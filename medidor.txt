@@ -1,0 +1,366 @@
+/*
+    Esse programa capta dados
+    do sensor de corrente ads1115,
+    trata essas dados e envia
+    por requisicao HTTP POST
+    para um servidor.
+
+    TABELA DE AJUSTE DE GANHO
+    3/4x gain   +/- 5.120V  1 bit = 2.5mV
+      1x gain   +/- 4.096V  1 bit = 2mV
+      2x gain   +/- 2.048V  1 bit = 1mV
+      4x gain   +/- 1.024V  1 bit = 0.5mV
+      8x gain   +/- 0.512V  1 bit = 0.25mV
+     16x gain   +/- 0.256V  1 bit = 0.125mV
+
+    Mapa EEPROM
+      recHour[0-23]   0 a 47
+       recDay[1-31]  48 a 109
+     recMonth[1-12] 110 a 135
+
+   By Eduardo Valentim
+   23/10/2017
+*/
+
+#include <SPI.h>
+//#include <ESP8266WebServer.h>
+//#include <WiFiManager.h>         //https://github.com/tzapu/WiFiManager
+#include <ESP8266WiFi.h>              // https://github.com/esp8266/Arduino
+#include <WiFiUdp.h>
+#include <Wire.h>
+#include <Adafruit_ADS1015.h>         // https://github.com/adafruit/Adafruit_ADS1X15
+#include <NTPClient.h>
+#include <TimeLib.h>
+#include <EEPROM.h>
+
+const char* myssid   = "netvirtuaterezinha";
+const char* password = "3357785800";
+           int ledSt = HIGH;   
+
+//===========================================
+//Inicializacao do WiFiManager
+//WiFiManager wifiManager;
+//Inicializacao so servidor http na porta 80
+WiFiServer server(80);
+//===========================================
+
+
+WiFiClient client;
+WiFiUDP ntpUDP;
+const unsigned long DEFAULT_TIME = 1357041600;
+int16_t  utc = -2;
+NTPClient timeClient(ntpUDP, "a.st1.ntp.br", utc*3600, 60000);
+
+Adafruit_ADS1115 ads01(0x48);
+Adafruit_ADS1115 ads02(0x49);
+  
+const float    multiplier = 0.00725F;
+const uint16_t numSamples = 800;
+
+double   offset[4], filtered[4];
+float    sum[4], Irms[4], sample[4], timeCicle;
+float    Power, acHour, acDay, acMonth, consKWH, projKWH;
+uint16_t recHour[24], recDay[31], recMonth[12];
+uint16_t n, inicio, fim, espera;
+int8_t   rssi, dia, mes, ano, hora, minuto;
+uint8_t  pos, LB, HB, valor, i;
+uint8_t  lastDay, LDM, lastMonth;
+String   Ciclo, AcumHora, AcumDia, AcumMes, Projetado, UltimaHora, UltimoDia, UltimoMes;
+
+//========== Setup ===========================================================
+
+void setup() {
+
+randomSeed(666);
+
+     fim = 0;
+  espera = 1000;
+  
+//  ads02.setGain(GAIN_TWO);
+//  ads01.setGain(GAIN_TWO);
+//  ads01.begin();
+//  ads02.begin();
+
+       pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, ledSt);
+  
+  EEPROM.begin(512);
+  Serial.begin(115200);
+
+  WiFi.begin(myssid, password);
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(100);
+    }
+  delay(1000);
+  
+  for ( i=0; i < 19; i++) {
+    if ( ledSt == LOW)ledSt = HIGH;
+    else ledSt = LOW;
+    digitalWrite(LED_BUILTIN, ledSt);
+    delay(100);
+  }
+  digitalWrite(LED_BUILTIN, HIGH);
+  
+  Serial.println("Wifi Conectado");
+  // Start the server
+  server.begin();
+  Serial.println("Servidor iniciado");
+  Serial.println(WiFi.localIP());
+
+  
+  delay(100);
+  Serial.printf("Sinal: %ddB\n", WiFi.RSSI());
+  delay(100);
+  
+  timeClient.begin();
+  timeClient.forceUpdate();
+  setTime(timeClient.getEpochTime());
+  hora = hour();
+   dia = day();
+   mes = month();
+  
+  delay(1000);
+
+// ========== Recuperação de Variaveis ======================================
+
+    for ( i =0; i <= 23; i++ ) {
+      HB = EEPROM.read( i*2 );
+      LB = EEPROM.read( i*2+1);
+      recHour[i] = word( HB, LB );
+      Serial.printf ("recHour[%d] = %d\n", i, recHour[i]);
+    }
+    
+    for ( i = 1; i <= 31; i++ ) {
+      HB = EEPROM.read( 46 + i*2 );
+      LB = EEPROM.read( 46 + i*2+1 );
+      recDay[i] = word( HB, LB );
+      Serial.printf ("recDay[%d] = %d\n", i, recDay[i]);
+    }
+    
+    for ( i = 1; i <= 12; i++ ) {
+      HB = EEPROM.read( 108 + i*2 );
+      LB = EEPROM.read( 108 + i*2+1 );
+      recMonth[i] = word( HB, LB );
+      Serial.printf ("recMonth[%d] = %d\n", i, recMonth[i]);
+    }
+}
+
+//=========== Loop Principal =================================================
+//============================================================================
+
+void loop() {
+
+  lastDay = day();
+  
+  inicio  = millis() - fim;
+  if (inicio <= 1000) {
+    espera = 1000 - inicio;
+  }
+  delay(espera);
+  fim = millis();
+  
+  digitalWrite(LED_BUILTIN, LOW);
+  delay (20);
+  digitalWrite(LED_BUILTIN, HIGH);
+  
+      for (n = 0; n < numSamples; n++) {
+            sample[1] = ads01.readADC_Differential_0_1();
+            offset[1] = (offset[1] + (sample[1] - offset[1]) / 1024);
+          filtered[1] = sample[1] - offset[1];
+              sum[1] += sq(filtered[1]);
+      }
+              Irms[1] = sqrt(sum[1] / numSamples) * multiplier;
+              Irms[1] = random(2, 10);
+               sum[1] = 0;
+
+      for (n = 0; n < numSamples; n++) {
+            sample[2] = ads01.readADC_Differential_2_3();
+            offset[2] = (offset[2] + (sample[2] - offset[2]) / 1024);
+          filtered[2] = sample[2] - offset[2];
+              sum[2] += sq(filtered[2]);
+      }
+              Irms[2] = sqrt(sum[2] / numSamples) * multiplier;
+              Irms[2] = random(1, 5);
+               sum[2] = 0;
+
+      for (n = 0; n < numSamples; n++) {
+            sample[3] = ads02.readADC_Differential_0_1();
+            offset[3] = (offset[3] + (sample[3] - offset[3]) / 1024);
+          filtered[3] = sample[3] - offset[3];
+              sum[3] += sq(filtered[3]);
+      }
+              Irms[3] = sqrt(sum[3] / numSamples) * multiplier;
+              Irms[3] = random(3, 15);
+               sum[3] = 0;
+
+       Irms[0]  = Irms[1]+Irms[2]+Irms[3];
+          Power = ((Irms[0] * 127) / 3600);  
+        acHour +=  Power;
+        acDay  +=  Power;
+       acMonth +=  Power;
+       consKWH +=  Power / 1000;      // unidade KWH
+       
+       timeCicle = (((day()-1) * 24) + hour() + (float(minute()) / 60));
+        
+       if (timeCicle != 0) {
+          projKWH = acMonth + ((acMonth / timeCicle) * (720 - timeCicle));
+       }
+      
+      if (minute() == 0 && second()== 0) {
+         hora = hour();  
+         recHour[hora] = int (acHour);
+         Register(hora*2, int (recHour[hora]));
+         acHour = 0;
+         hora = hour();
+      }
+      
+      if (hour() == 0 && minute() == 0 && second() == 0) {
+         dia = day();
+         if ( dia == 1 ) LDM = lastDay;
+         recDay[dia] = acDay;
+         Register(48+(dia-1)*2, int(recDay[dia]));
+         acDay = 0;
+      }
+      
+      if (day() == 1 && hour() == 0 && minute() == 0 && second() == 0) {
+         mes = month();
+         recMonth[mes] = acMonth;
+         Register(110+(mes-1)*2, int(recMonth[mes]));
+         acMonth = 0;
+         projKWH = 0;
+      }
+
+//========== Debug ======================================================
+        
+//        Serial.println();
+//           Serial.printf (" %d/%d/%d  %d:%d:%d  %d\n", 
+//                          day(), month(), year(),
+//                          hour(), minute(), second(), espera);
+//        
+//        for (i = 1; i <= 3; i++) {
+//           Serial.printf ("   L%d: %d Watts\n", i, int(Irms[i] * 127));
+//        }
+//          Serial.println ("---------------------------------");
+//          Serial.print   ("      Ciclo: ");
+//          Serial.print   (timeCicle);
+//          Serial.println (" horas");
+
+          Ciclo = "      Ciclo: " + String(timeCicle) + " horas"; 
+
+        if (acHour < 1000){
+        //   Serial.printf (" Acum. hora: %d WH\n", int(acHour));
+           AcumHora = "Acum. hora: " +  String(int(acHour)) + " WH" ;
+        }   
+        else {
+       //    Serial.printf (" Acum. hora: %d KWH\n", int(acHour/1000));
+           AcumHora = "Acum. hora: " + String(int(acHour/1000)) + " KWH ";
+        }
+
+        if (acDay < 1000){
+       //    Serial.printf ("  Acum. dia: %d WH\n",  int(acDay));
+           AcumDia = "Acum. dia: " +  String(int(acDay)) + " WH" ;
+        }   
+        else {
+         //  Serial.printf ("  Acum. dia: %d KWH\n", int(acDay/1000));
+           AcumDia = "Acum. dia: " +  String(int(acDay/1000)) + " KWH" ; 
+        }
+
+        if (acMonth < 1000) {
+       //    Serial.printf ("  Acum. mes: %d WH\n", int(acMonth));
+           AcumMes = "Acum. mes: " +  String(int(acMonth)) + " WH" ;
+        }   
+        else {
+       //    Serial.printf ("  Acum. mes: %d KWH\n", int(acMonth/1000));
+           AcumMes = "Acum. mes: " +  String(int(acMonth/1000)) + " KWH" ; 
+        }    
+
+        if (projKWH < 1.0) {
+       //    Serial.printf ("  Projetado: %d WH\n", int(projKWH));
+           Projetado = "Projetado: " +  String(int(projKWH)) + " WH" ;
+        }   
+        else {
+        //   Serial.printf ("  Projetado: %d KWH\n", int(projKWH/1000));
+           Projetado =  "Projetado: " +  String(int(projKWH/1000)) + " KWH" ; 
+        } 
+
+       
+       if (hora == 0) hora = 23;
+       
+      // Serial.printf ("Ultima hora: %d WH (%d)\n", int(recHour[hora-1]), hora-1);
+       UltimaHora = "Ultima hora: " +  String(int(recHour[hora-1]))  +  " WH (" + String(hora-1) + ")";
+
+       
+       if (dia == 1) {
+      //     Serial.printf (" Ultimo dia: %d KWH (%d)\n", int(recDay[LDM]), LDM);
+           UltimoDia = "Ultimo dia: " +  String(int(recDay[LDM]))  +  " KWH (" + String(LDM) + ")";
+        }   
+        else {  
+        //   Serial.printf (" Ultimo dia: %d KWH (%d)\n", int(recDay[mes-1]), dia-1);
+           UltimoDia = "Ultimo dia: " +  String(int(recDay[mes-1]))  +  " KWH (" + String(dia-1) + ")";
+        }   
+           
+     //  Serial.printf (" Ultimo mes: %d KWH (%d)\n", int(recMonth[mes-1]/1000), mes-1);
+       UltimoMes = "Ultimo mes: " +  String(int(recMonth[mes-1]))  + " KWH (" + String(mes-1) + ")";
+       
+       //==========================================================================
+       WiFiClient client = server.available();
+        if (!client) {
+          return;
+        }    
+        while(!client.available()){
+           delay(1);
+        }
+       // String req = client.readStringUntil('\r');
+       // Serial.println(req);
+        client.flush();   
+
+        String buf = "";
+ 
+        buf += "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<!DOCTYPE HTML>\r\n";
+        buf += "<html lang=\"en\"><head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1, user-scalable=no\"/>\r\n";
+        buf += "<meta http-equiv=\"refresh\" content=\"5\">\r\n";
+        buf += "<title>ESP8266 Web Server</title>";
+        buf += "<style>.c{text-align: center;} div,input{padding:5px;font-size:1em;} input{width:80%;} body{text-align: center;font-family:verdana;} button{border:0;border-radius:0.3rem;background-color:#1fa3ec;color:#fff;line-height:2.4rem;font-size:1.2rem;width:100%;} .q{float: right;width: 64px;text-align: right;}</style>";
+        buf += "</head>";
+        buf += "<h3>Monitoramento de Consumo de Energia</h3>";
+        buf += "<p>---------------------------------</p>";
+        buf += "<p>Ciclo: " +  String(timeCicle) + " horas</p>";
+        buf += "<p>" + AcumHora + "</p>";
+        buf += "<p>" + AcumDia + "</p>";
+        buf += "<p>" + AcumMes + "</p>";
+        buf += "<p>" + Projetado + "</p>";
+        buf += "<p>" + UltimaHora + "</p>";
+        buf += "<p>" + UltimoDia + "</p>";
+        buf += "<p>" + UltimoMes + "</p>";
+        buf += "</html>\n";
+
+       // Ciclo, AcumHora, AcumDia, AcumMes, Projetado, UltimaHora, UltimoDia, UltimoMes
+       
+        client.print(buf);
+       // client.flush();
+        //client.stop();
+       
+}
+
+//========== Register ========================================================
+//============================================================================
+void Register (int pos, int valor) {
+
+  Serial.print  (String(pos));
+  Serial.print  (" - ");
+  Serial.println(String(valor));
+  
+  LB = lowByte (valor);
+  HB = highByte(valor);
+
+  EEPROM.write (  pos, HB);
+  EEPROM.write (pos+1, LB);
+
+  HB = EEPROM.read (pos);
+  LB = EEPROM.read (pos+1);
+
+  Serial.print   ("Registrado :");
+  Serial.println (String(word(HB, LB)));
+
+}
+
